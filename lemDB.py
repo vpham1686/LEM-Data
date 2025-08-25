@@ -36,6 +36,35 @@ def safe_sorted_unique(values: Iterable[Any]) -> List[str]:
     ser = pd.Series(values).dropna()
     return sorted(ser.astype(str).unique().tolist(), key=lambda v: v.lower())
 
+def _weighted_mean(series, weights):
+    s = pd.to_numeric(series, errors="coerce")
+    w = pd.to_numeric(weights, errors="coerce").fillna(0).clip(lower=0)
+    mask = (~s.isna()) & (w > 0)
+    if mask.any():
+        return float(np.average(s[mask], weights=w[mask]))
+    return np.nan
+
+def _pie_chart(df, cat_col, val_col, donut=False):
+    """Simple pie/donut (controlled by external multiselect)."""
+    if df.empty:
+        return None
+    d = df.copy()
+    total = d[val_col].sum()
+    d["Pct"] = d[val_col] / total if total else 0
+    return (
+        alt.Chart(d)
+        .mark_arc(innerRadius=60 if donut else 0, outerRadius=120)
+        .encode(
+            theta=alt.Theta(f"{val_col}:Q", stack=True),
+            color=alt.Color(f"{cat_col}:N", legend=alt.Legend(title=cat_col)),
+            tooltip=[
+                alt.Tooltip(f"{cat_col}:N", title=cat_col),
+                alt.Tooltip(f"{val_col}:Q", title="Units", format=",.0f"),
+                alt.Tooltip("Pct:Q", title="Share", format=".1%"),
+            ],
+        )
+    )
+
 @st.cache_data(show_spinner=False)
 def load_data(fallback_path="LEM Data.xlsx"):
     if os.path.exists(fallback_path):
@@ -72,13 +101,15 @@ def load_data(fallback_path="LEM Data.xlsx"):
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
+    # Ensure Reporting year displays as integer (no decimals)
+    if "Reporting year" in df.columns:
+        df["Reporting year"] = pd.to_numeric(df["Reporting year"], errors="coerce").astype("Int64")
+
     # Year midpoint + age (static reference year 2025)
     if "Year of Manufacture" in df.columns:
         df["Manufacture Mid Year"] = df["Year of Manufacture"].apply(decade_midpoint)
         rep_year = 2025
         df["Est. Age (yrs)"] = rep_year - df["Manufacture Mid Year"]
-
-        # Remove negatives (future mid-years / bad parses) and future mid-years
         df.loc[df["Est. Age (yrs)"] < 0, "Est. Age (yrs)"] = np.nan
         df.loc[df["Manufacture Mid Year"] > rep_year, "Manufacture Mid Year"] = np.nan
     else:
@@ -117,24 +148,40 @@ def apply_filters(dd: pd.DataFrame) -> pd.DataFrame:
     if age_range and "Est. Age (yrs)" in out.columns:
         out = out[out["Est. Age (yrs)"].between(age_range[0], age_range[1], inclusive="both")]
     if hp_range and "hp" in out.columns:
-        out = out[out["hp"].between(hp_range[0], hp_range[1], inclusive="both")]
+        hp_series = pd.to_numeric(out["hp"], errors="coerce")
+        mask = hp_series.between(hp_range[0], hp_range[1], inclusive="both")
+        if include_missing_hp:
+            mask = mask | hp_series.isna()
+        out = out[mask]
     return out
-
-def _weighted_mean(series, weights):
-    s = pd.to_numeric(series, errors="coerce")
-    w = pd.to_numeric(weights, errors="coerce").fillna(0).clip(lower=0)
-    mask = (~s.isna()) & (w > 0)
-    if mask.any():
-        return float(np.average(s[mask], weights=w[mask]))
-    return np.nan
 
 # -----------------------------
 # UI — Title & Sidebar
 # -----------------------------
 st.title("🚆 Rail Fleet Explorer")
-st.caption("Interactive explorer for locomotive data (US EPA Tier, horsepower, age, operator classes). Age referenced to year **2025**.")
+st.caption("Interactive explorer for locomotive data. Age referenced to year **2025**.")
 
-df_raw, df = load_data()
+df_raw, df_all = load_data()
+
+# Year selectors: single year or compare with a second year
+with st.sidebar:
+    years_all = sorted(pd.Series(df_all["Reporting year"]).dropna().astype(int).unique().tolist()) if "Reporting year" in df_all.columns else []
+    if years_all:
+        sel_year = st.selectbox("Reporting year", years_all, index=0, format_func=lambda y: f"{y}")
+        compare_mode = st.checkbox("Compare with another year", value=False)
+        if compare_mode:
+            years_second = [y for y in years_all if y != sel_year]
+            sel_year2 = st.selectbox("Compare to", years_second, index=0, format_func=lambda y: f"{y}")
+            chosen_years = [sel_year, sel_year2]
+        else:
+            sel_year2 = None
+            chosen_years = [sel_year]
+        df = df_all[df_all["Reporting year"].isin(chosen_years)].copy()
+    else:
+        sel_year = None
+        sel_year2 = None
+        compare_mode = False
+        df = df_all.copy()
 
 with st.sidebar.expander("🔎 Filters", expanded=True):
     oems  = safe_sorted_unique(df["OEM"]) if "OEM" in df.columns else []
@@ -174,7 +221,8 @@ with st.sidebar.expander("🔎 Filters", expanded=True):
     else:
         hp_range = None
 
-# Sidebar footer note
+    include_missing_hp = st.checkbox("Include rows with missing horsepower", value=True)
+
 st.sidebar.markdown(
     "<hr style='margin-top:8px; margin-bottom:8px; opacity:0.3;'>"
     "<div style='font-size:12px; opacity:0.7;'>Last updated by Victor Pham, August 2025</div>",
@@ -197,82 +245,176 @@ col2.metric("Avg. Estimated Age (yrs)", f"{avg_age:,.1f}" if not np.isnan(avg_ag
 col3.metric("Avg. Horsepower", f"{avg_hp:,.0f}" if not np.isnan(avg_hp) else "—")
 col4.metric("Unique Models", f"{int(unique_models):,}" if not np.isnan(unique_models) else "—")
 
+# Per-year quick table when comparing
+if compare_mode and "Reporting year" in df_f.columns:
+    per_year = (
+        df_f.assign(Year=df_f["Reporting year"].astype(int))
+            .groupby("Year")
+            .agg(
+                Units=("Count","sum"),
+                Avg_Age=("Est. Age (yrs)", lambda s: _weighted_mean(s, df_f.loc[s.index,"Count"])),
+                Avg_hp=("hp", lambda s: _weighted_mean(s, df_f.loc[s.index,"Count"])),
+                Unique_Models=("Model", "nunique")
+            )
+    )
+    st.dataframe(per_year, use_container_width=True)
+
 st.divider()
 
 # -----------------------------
-# Charts & Tables
+# Charts & Tables with chart selectors
 # -----------------------------
 tabs = st.tabs(["Tier Distribution", "Age Distribution", "Horsepower by Operator", "OEM / Model Breakdown", "Raw Data"])
 
+# --- Tier Distribution ---
 with tabs[0]:
     st.subheader("US EPA Tier Distribution")
-    if "US EPA Tier Level" in df_f.columns and "Count" in df_f.columns:
+    chart_choice = st.radio("Chart type", ["Bar", "Pie", "Donut"], horizontal=True, key="tier_chart_choice")
+    if all(c in df_f.columns for c in ["US EPA Tier Level","Count","Reporting year"]):
         temp = df_f.copy()
+        temp["Year"] = temp["Reporting year"].astype("Int64")
         temp["US EPA Tier Level"] = temp["US EPA Tier Level"].astype(str)
+
         tier_df = (
-            temp.groupby("US EPA Tier Level", dropna=False)["Count"]
-                .sum().reset_index().rename(columns={"Count": "Units"})
-                .sort_values("Units", ascending=False)
+            temp.groupby(["Year","US EPA Tier Level"], dropna=False)["Count"]
+                .sum()
+                .reset_index()
+                .rename(columns={"US EPA Tier Level": "Tier", "Count": "Units"})
         )
+
+        # Multiselect tiers (default: all)
+        all_tiers = tier_df["Tier"].dropna().astype(str).unique().tolist()
+        selected_tiers = st.multiselect("Show tiers", all_tiers, default=all_tiers, key="tier_include")
+        tier_df = tier_df[tier_df["Tier"].isin(selected_tiers)]
+
         if not tier_df.empty:
-            chart = alt.Chart(tier_df).mark_bar().encode(
-                x=alt.X("Units:Q", title="Units"),
-                y=alt.Y("US EPA Tier Level:N", sort='-x', title="Tier"),
-                tooltip=["US EPA Tier Level:N", "Units:Q"],
-            )
+            if chart_choice == "Bar":
+                base = alt.Chart(tier_df).mark_bar().encode(
+                    x=alt.X("Units:Q", title="Units"),
+                    y=alt.Y("Tier:N", sort='-x', title="Tier"),
+                    tooltip=["Year:N","Tier:N","Units:Q"],
+                    color=alt.Color("Year:N", legend=alt.Legend(title="Year")) if compare_mode else alt.value("#4c78a8"),
+                )
+                chart = base if not compare_mode else base.facet(column=alt.Column("Year:N", header=alt.Header(title="")))
+            else:
+                pie = _pie_chart(tier_df, "Tier", "Units", donut=(chart_choice == "Donut"))
+                chart = pie if not compare_mode else pie.facet(column=alt.Column("Year:N", header=alt.Header(title="")))
             st.altair_chart(chart, use_container_width=True)
         else:
-            st.info("No data after filters.")
+            st.info("Select at least one tier.")
+    else:
+        st.info("Tier or Year columns not found.")
 
+# --- Age Distribution ---
 with tabs[1]:
     st.subheader("Estimated Age Distribution")
-    if "Est. Age (yrs)" in df_f.columns and "Count" in df_f.columns:
+    chart_choice_age = st.radio("Chart type", ["Histogram", "Density"], horizontal=True, key="age_chart_choice")
+    if all(c in df_f.columns for c in ["Est. Age (yrs)","Count","Reporting year"]):
         ages = df_f.dropna(subset=["Est. Age (yrs)"]).copy()
+        ages["Year"] = ages["Reporting year"].astype("Int64")
         ages["Count"] = pd.to_numeric(ages["Count"], errors="coerce").fillna(0).astype(int).clip(lower=1)
         ages_rep = ages.loc[ages.index.repeat(ages["Count"])]
         if not ages_rep.empty:
-            hist = alt.Chart(ages_rep).transform_bin(
-                "age_bin", field="Est. Age (yrs)", bin=alt.Bin(maxbins=25)
-            ).mark_bar().encode(
-                x=alt.X("age_bin:Q", title="Estimated Age (yrs)", scale=alt.Scale(domainMin=0)),
-                y=alt.Y("count()", title="Units"),
-                tooltip=[alt.Tooltip("count()", title="Units")],
-            )
-            st.altair_chart(hist, use_container_width=True)
+            if chart_choice_age == "Histogram":
+                base = (
+                    alt.Chart(ages_rep)
+                    .transform_bin("age_bin", field="Est. Age (yrs)", bin=alt.Bin(maxbins=25))
+                    .mark_bar()
+                    .encode(
+                        x=alt.X("age_bin:Q", title="Estimated Age (yrs)", scale=alt.Scale(domainMin=0)),
+                        y=alt.Y("count()", title="Units"),
+                        tooltip=[alt.Tooltip("count()", title="Units")],
+                        color=alt.Color("Year:N", legend=alt.Legend(title="Year")) if compare_mode else alt.value("#4c78a8"),
+                    )
+                )
+                chart = base if not compare_mode else base.facet(column=alt.Column("Year:N", header=alt.Header(title="")))
+            else:
+                # FIX: compute density per Year using groupby to avoid 'undefined'
+                density_kwargs = {"groupby": ["Year"]} if compare_mode else {}
+                base = (
+                    alt.Chart(ages_rep.rename(columns={"Est. Age (yrs)":"Age"}))
+                    .transform_density("Age", as_=["Age", "density"], **density_kwargs)
+                    .mark_area(opacity=0.6)
+                    .encode(
+                        x=alt.X("Age:Q", title="Estimated Age (yrs)"),
+                        y=alt.Y("density:Q", title="Density"),
+                        color=alt.Color("Year:N", legend=alt.Legend(title="Year")) if compare_mode else alt.value("#4c78a8"),
+                    )
+                )
+                chart = base if not compare_mode else base.facet(column=alt.Column("Year:N", header=alt.Header(title="")))
+            st.altair_chart(chart, use_container_width=True)
         else:
             st.info("No data after filters.")
+    else:
+        st.info("Required columns not found.")
 
+# --- Horsepower by Operator ---
 with tabs[2]:
-    st.subheader("Average Horsepower by Operator Type")
-    if all(c in df_f.columns for c in ["hp", "Operator Type", "Count"]):
+    st.subheader("Horsepower by Operator Type")
+    chart_choice_hp = st.radio("Chart type", ["Bar", "Box"], horizontal=True, key="hp_chart_choice")
+    if all(c in df_f.columns for c in ["hp","Operator Type","Count","Reporting year"]):
         tmp = df_f.copy()
         tmp["hp"] = pd.to_numeric(tmp["hp"], errors="coerce")
         tmp["w"] = pd.to_numeric(tmp["Count"], errors="coerce").fillna(0).clip(lower=0)
-        hp_by_op = (
-            tmp.groupby("Operator Type", dropna=False)
-               .apply(lambda g: _weighted_mean(g["hp"], g["w"]))
-               .reset_index(name="Avg hp")
-               .sort_values("Avg hp", ascending=False, na_position="last")
-        )
-        if hp_by_op["Avg hp"].notna().any():
-            chart = alt.Chart(hp_by_op.dropna()).mark_bar().encode(
-                x=alt.X("Avg hp:Q", title="Average hp"),
-                y=alt.Y("Operator Type:N", sort='-x'),
-                tooltip=["Operator Type:N", alt.Tooltip("Avg hp:Q", format=".0f")],
-            )
-            st.altair_chart(chart, use_container_width=True)
-        else:
-            st.info("No horsepower data after filters.")
+        tmp["Year"] = tmp["Reporting year"].astype("Int64")
 
+        if chart_choice_hp == "Bar":
+            hp_by = (
+                tmp.groupby(["Year","Operator Type"], dropna=False)
+                   .apply(lambda g: _weighted_mean(g["hp"], g["w"]))
+                   .reset_index(name="Avg hp")
+            )
+            if hp_by["Avg hp"].notna().any():
+                base = alt.Chart(hp_by.dropna()).mark_bar().encode(
+                    x=alt.X("Avg hp:Q", title="Average hp"),
+                    y=alt.Y("Operator Type:N", sort='-x', title="Operator"),
+                    tooltip=["Year:N","Operator Type:N", alt.Tooltip("Avg hp:Q", format=".0f")],
+                    color=alt.Color("Year:N", legend=alt.Legend(title="Year")) if compare_mode else alt.value("#4c78a8"),
+                )
+                chart = base if not compare_mode else base.facet(column=alt.Column("Year:N", header=alt.Header(title="")))
+                st.altair_chart(chart, use_container_width=True)
+            else:
+                st.info("No horsepower data after filters.")
+        else:  # Box
+            rep = tmp.dropna(subset=["hp"]).copy()
+            rep["w_int"] = rep["w"].astype(int).clip(lower=1)
+            rep = rep.loc[rep.index.repeat(rep["w_int"])]
+            if rep.empty:
+                st.info("No horsepower data after filters.")
+            else:
+                base = alt.Chart(rep).mark_boxplot().encode(
+                    x=alt.X("hp:Q", title="hp"),
+                    y=alt.Y("Operator Type:N", title="Operator"),
+                    color=alt.Color("Year:N", legend=alt.Legend(title="Year")) if compare_mode else alt.value("#4c78a8"),
+                )
+                chart = base if not compare_mode else base.facet(column=alt.Column("Year:N", header=alt.Header(title="")))
+                st.altair_chart(chart, use_container_width=True)
+    else:
+        st.info("Required columns not found.")
+
+# --- OEM / Model Breakdown ---
 with tabs[3]:
     st.subheader("OEM / Model Breakdown")
-    if "OEM" in df_f.columns and "Model" in df_f.columns and "Count" in df_f.columns:
-        pivot = df_f.pivot_table(index="OEM", columns="Model", values="Count", aggfunc="sum", fill_value=0).astype(int)
-        st.dataframe(pivot, use_container_width=True)
+    if all(c in df_f.columns for c in ["OEM","Model","Count","Reporting year"]):
+        if compare_mode:
+            c1, c2 = st.columns(2)
+            y1, y2 = chosen_years
+            p1 = df_f[df_f["Reporting year"] == y1].pivot_table(index="OEM", columns="Model", values="Count", aggfunc="sum", fill_value=0).astype(int)
+            p2 = df_f[df_f["Reporting year"] == y2].pivot_table(index="OEM", columns="Model", values="Count", aggfunc="sum", fill_value=0).astype(int)
+            with c1:
+                st.caption(f"Pivot — {int(y1)}")
+                st.dataframe(p1, use_container_width=True)
+            with c2:
+                st.caption(f"Pivot — {int(y2)}")
+                st.dataframe(p2, use_container_width=True)
+        else:
+            pivot = df_f.pivot_table(index="OEM", columns="Model", values="Count", aggfunc="sum", fill_value=0).astype(int)
+            st.dataframe(pivot, use_container_width=True)
         st.caption("Values represent unit counts by OEM × Model after filters.")
     else:
-        st.info("OEM or Model columns not found.")
+        st.info("OEM/Model columns not found.")
 
+# --- Raw Data ---
 with tabs[4]:
     st.subheader("Raw Data (after filters)")
     show_cols = [c for c in [
@@ -290,4 +432,8 @@ with tabs[4]:
                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 st.divider()
-st.caption("Use the sidebar to filter by OEM, model, tier, operator type, manufacture-year range, estimated age (yrs), and horsepower. Age is computed as 2025 − Manufacture Mid Year.")
+st.caption(
+    "Pick one year or enable comparison. Density now computes per-year correctly. "
+    "Tier pies support multiselect. Age: Histogram or Density. "
+    "Horsepower: Bar (weighted average) or Box. Age is computed as 2025 − Manufacture Mid Year."
+)
